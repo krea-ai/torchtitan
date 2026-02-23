@@ -6,19 +6,15 @@
 
 import logging
 import os
+from dataclasses import replace
 from typing import Any, Optional
 
 import torch
-import torch.distributed.checkpoint as dcp
 import torchtitan.protocols.train_spec as train_spec_module
 from monarch.actor import Actor, endpoint
 
 from torch.distributed._tensor import DTensor
-from torch.distributed.checkpoint.state_dict import (
-    get_model_state_dict,
-    set_model_state_dict,
-    StateDictOptions,
-)
+
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.experiments.rl.unified.actors.grader import Episodes
@@ -31,13 +27,35 @@ from torchtitan.experiments.rl.unified.configs import RLTrainer
 from torchtitan.experiments.rl.unified.models.utils import (
     replace_with_vllm_compatible_flash_attention,
 )
-from torchtitan.experiments.rl.vllm_compat.simple_rl import (
-    compute_grpo_advantages,
-    compute_grpo_advantages_stable,
-)
+
 from torchtitan.tools import utils
 
 logger = logging.getLogger(__name__)
+
+
+def _set_nccl_determinism_envs() -> None:
+    """Set environment variables to force deterministic NCCL collective operations.
+
+    This configures NCCL to use a single-channel tree all-reduce with the Simple
+    protocol, ensuring a fixed reduction order and bitwise-reproducible results
+    at the cost of reduced throughput.
+    """
+    # Disable symmetric memory all-reduce (non-deterministic)
+    os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
+    # Deterministic cuBLAS
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    # NCCL determinism: fixed tree algorithm, simple protocol,
+    # single channel/thread to ensure identical reduction order
+    os.environ["NCCL_LAUNCH_MODE"] = "GROUP"
+    os.environ["NCCL_COLLNET_ENABLE"] = "0"
+    os.environ["NCCL_NVLS_ENABLE"] = "0"
+    os.environ["NCCL_P2P_NET_DISABLE"] = "1"
+    os.environ["NCCL_MIN_NCHANNELS"] = "1"
+    os.environ["NCCL_MAX_NCHANNELS"] = "1"
+    os.environ["NCCL_PROTO"] = "Simple"
+    os.environ["NCCL_ALGO"] = "allreduce:tree"
+    os.environ["NCCL_NTHREADS"] = "1"
+    os.environ["NCCL_SOCKET_NTHREADS"] = "1"
 
 
 class Trainer(Actor):
@@ -74,6 +92,10 @@ class Trainer(Actor):
         self.grpo_beta = config.policy_optimization.beta
         self.use_stable_grpo = config.policy_optimization.use_stable
 
+        # Batch invariant mode: set NCCL determinism env vars
+        if config.batch_invariant_mode:
+            _set_nccl_determinism_envs()
+
         # Device setup
         device_module, device_type = utils.device_module, utils.device_type
         self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
@@ -99,6 +121,16 @@ class Trainer(Actor):
             etp=parallelism_config.expert_tensor_parallel_degree,
             world_size=world_size,
         )
+
+        # Enable PyTorch determinism when batch invariant mode is on
+        if config.batch_invariant_mode:
+            debug_config = replace(trainer_cfg.debug, deterministic=True)
+            dist_utils.set_determinism(
+                self.parallel_dims,
+                self.device,
+                debug_config,
+                distinct_seed_mesh_dims=["pp"],
+            )
 
         # Get train spec for the model
         self.train_spec = train_spec_module.get_train_spec(trainer_cfg.model.name)
