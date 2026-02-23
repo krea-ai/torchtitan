@@ -11,16 +11,15 @@ from typing import Any, Optional
 import torch
 from monarch.actor import Actor, endpoint
 from torchtitan.experiments.rl.unified.actors.generator import TrajectoryData
+from torchtitan.experiments.rl.unified.configs import RLTrainer
 from torchtitan.experiments.rl.unified.infra.parallelism_utils import (
     create_trainer_parallel_dims,
 )
-from torchtitan.experiments.rl.unified.models.utils import load_model, ModelMode
+from torchtitan.experiments.rl.unified.models.utils import load_trainer_model
 from torchtitan.experiments.rl.vllm_compat.simple_rl import (
     compute_policy_gradient_loss_vllm,
 )
-from torchtitan.experiments.rl.vllm_compat.weights_vllm_compat import (
-    torchtitan_to_vllm_compat,
-)
+from torchtitan.experiments.rl.vllm_compat.weights.converter import torchtitan_to_vllm
 
 logger = logging.getLogger(__name__)
 
@@ -30,45 +29,54 @@ class Trainer(Actor):
     Updates policy based on collected trajectories.
 
     Run model forward on trajectories, computes loss, and run backward.
+    Receives the top-level ``RLTrainer.Config`` and reads policy trainer
+    settings (batch_invariant_mode, grpo) directly from it, plus model /
+    optimizer / parallelism settings from the nested ``config.trainer``.
+
+    TODO: Use torchtitan Trainer for model init and parallelisation.
 
     Args:
-        titan_checkpoint_path: Path to TorchTitan checkpoint
-        model_path: Path to HuggingFace model
-        learning_rate: Learning rate for optimizer
-        model_mode: Indicates which model to use. Train inferece unified model, batch invariant Torchtitan model,
-            or plain Torchtitan model
+        config: Top-level RLTrainer.Config containing all configuration.
     """
 
     def __init__(
         self,
-        titan_checkpoint_path: str,
-        model_path: str,
-        learning_rate: float = 1e-5,
-        model_mode: str = ModelMode.VLLM_COMPAT,
-        ddp_size: int = 1,
-        tp_size: int = 1,
+        config: RLTrainer.Config,
     ):
+        self.config = config
+        trainer_cfg = config.trainer
+
+        # Extract needed fields from config
+        model_path = trainer_cfg.checkpoint.initial_load_path  # path to HF checkpoint
+        learning_rate = trainer_cfg.optimizer.lr
+        self.ddp_size = trainer_cfg.parallelism.data_parallel_replicate_degree
+        self.tp_size = trainer_cfg.parallelism.tensor_parallel_degree
+
+        # GRPO settings from top-level config
+        self.group_size = config.policy_optimization.group_size
+        self.grpo_beta = config.policy_optimization.beta
+        self.use_stable_grpo = config.policy_optimization.use_stable
+
         # Explicitly set cuda device for each trainer, otherwise different processes will use the same CUDA device
         local_rank = int(os.environ["LOCAL_RANK"])
         device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(local_rank)
 
-        self.model = load_model(
-            titan_checkpoint_path, model_path, model_mode=model_mode
-        )
-        self.ddp_size = ddp_size
-        self.tp_size = tp_size
+        # load trainer model and patch to vllm.Attention()
+        self.model = load_trainer_model(model_path)
+
         self.parallel_dims = create_trainer_parallel_dims(self.ddp_size, self.tp_size)
 
         # apply PT-D Parallelism
         # TODO: right now it only works for qwen3 model, need to formalize this to use parallize_fn from train_spec
-        from torchtitan.models.llama3.infra.parallelize import apply_ddp
+        if self.ddp_size > 1:
+            from torchtitan.models.llama3.infra.parallelize import apply_ddp
 
-        apply_ddp(
-            self.model,
-            self.parallel_dims.get_mesh("dp_replicate"),
-            enable_compile=False,
-        )
+            apply_ddp(
+                self.model,
+                self.parallel_dims.get_mesh("dp_replicate"),
+                enable_compile=False,
+            )
 
         self.model = self.model.to(device)
         self.model.train()
@@ -78,18 +86,22 @@ class Trainer(Actor):
         self.policy_version = 0
         self.generator: Optional[Any] = None
 
-        logger.info("Trainer initialized with TorchTitan model")
+        logger.info(
+            f"Trainer initialized: "
+            f"group_size={self.group_size}, grpo_beta={self.grpo_beta}, "
+            f"use_stable_grpo={self.use_stable_grpo}"
+        )
 
     @endpoint
     async def get_weights(self) -> dict:
-        """Get vLLM-compatible weights for generator.
+        """Get vLLM weights for generator.
 
         Returns:
-            vLLM-compatible state dict
+            vLLM state dict
         """
         titan_state = self.model.state_dict()
-        vllm_compat_state = torchtitan_to_vllm_compat(titan_state)
-        return vllm_compat_state
+        vllm_state = torchtitan_to_vllm(titan_state)
+        return vllm_state
 
     @endpoint
     async def step(self, trajectory: TrajectoryData) -> dict:

@@ -48,11 +48,10 @@ python torchtitan/experiments/rl/unified/infer.py --tensor-parallel-size 2
 ```
 
 5. Run simple rl loop
-```bash
-VLLM_BATCH_INVARIANT=1 VLLM_ATTENTION_BACKEND=FLASH_ATTN python3 torchtitan/experiments/rl/unified/simple_rl_multiprocess.py
 ```
-Right now we only support VLLM_COMPAT mode, which could achieve trainer and generator bitwise identical. We are working on support UNIFIED mode,
-which uses a unified model definition for trainer and generator.
+python3 torchtitan/experiments/rl/unified/simple_grpo.py --checkpoint.initial_load_path=<path_to_model_checkpoint>
+```
+We use a unified model definition for the trainer and generator, ensuring bitwise-identical models to address a class of subtle correctness bugs in RL for LLMs.
 
 ## TODO
 Work on batch invariance:
