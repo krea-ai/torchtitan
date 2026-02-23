@@ -11,7 +11,7 @@ This module provides TorchTitanVLLMModel: Core model class that adapts
 TorchTitan models for vLLM.
 """
 
-from functools import partial
+from dataclasses import replace as dataclass_replace
 
 import torch
 import torch.nn as nn
@@ -27,7 +27,7 @@ from torchtitan.experiments.rl.unified.infra.parallelism_utils import (
 )
 
 from torchtitan.experiments.rl.unified.models.utils import replace_with_vllm_attention
-from torchtitan.models.qwen3.model import precompute_rope_cache
+from torchtitan.models.common import RoPE
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.model_spec import ParallelizeFunction
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
@@ -80,12 +80,11 @@ class TorchTitanVLLMModelWrapper(nn.Module):
         logger.info(f"Creating model with config: {model_config}")
         self.model = model_config.build()
 
-        # Setup RoPE cache extension function if provided
-        self.rope_cache_extension_fn = partial(
-            precompute_rope_cache,
-            dim=self.config.head_dim,
-            base=self.config.rope_theta,
-        )
+        # Setup RoPE cache extension function
+        rope_config = self.config.rope
+        self.rope_cache_extension_fn = lambda max_seq_len: RoPE(
+            dataclass_replace(rope_config, max_seq_len=max_seq_len)
+        ).cache
 
         # Create ParallelDims and JobConfig from vLLM config at runtime
         # vLLM config contains the tensor_parallel_size from command-line args
@@ -109,7 +108,12 @@ class TorchTitanVLLMModelWrapper(nn.Module):
         self.model = parallelize_fn(
             model=self.model,
             parallel_dims=self.parallel_dims,
-            job_config=self.parallel_config,
+            training=self.parallel_config.training,
+            model_converters=self.parallel_config.model_converters,
+            parallelism=self.parallel_config.parallelism,
+            compile_config=self.parallel_config.compile,
+            ac_config=self.parallel_config.activation_checkpoint,
+            dump_folder=self.parallel_config.dump_folder,
         )
 
     def _extend_rope_cache_if_needed(
@@ -153,7 +157,7 @@ class TorchTitanVLLMModelWrapper(nn.Module):
 
         # Use provided extension function
         try:
-            extended_cache = self.rope_cache_extension_fn(self.config, required_len)
+            extended_cache = self.rope_cache_extension_fn(max_seq_len=required_len)
             extended_cache = extended_cache.to(device=device, dtype=dtype)
         except Exception as e:
             logger.warning(
@@ -216,8 +220,8 @@ class TorchTitanVLLMModelWrapper(nn.Module):
 
         # Get RoPE cache (handle model-specific attribute names)
         # Use hasattr to avoid ambiguous boolean value error with tensors
-        if hasattr(self.model, "rope_cache"):
-            rope_attr = self.model.rope_cache
+        if hasattr(self.model, "rope") and hasattr(self.model.rope, "cache"):
+            rope_attr = self.model.rope.cache
         elif hasattr(self.model, "freqs_cis"):
             rope_attr = self.model.freqs_cis
         else:
