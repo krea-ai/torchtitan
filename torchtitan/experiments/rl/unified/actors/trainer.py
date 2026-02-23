@@ -9,30 +9,48 @@ import os
 from typing import Any, Optional
 
 import torch
+import torch.distributed.checkpoint as dcp
+import torchtitan.protocols.train_spec as train_spec_module
 from monarch.actor import Actor, endpoint
-from torchtitan.experiments.rl.unified.actors.generator import TrajectoryData
+
+from torch.distributed._tensor import DTensor
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict,
+    set_model_state_dict,
+    StateDictOptions,
+)
+from torchtitan.config import TORCH_DTYPE_MAP
+from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.experiments.rl.unified.actors.grader import Episodes
+from torchtitan.experiments.rl.unified.actors.utils import (
+    compute_policy_gradient_loss,
+    compute_token_log_probs,
+    verify_logprob_identity,
+)
 from torchtitan.experiments.rl.unified.configs import RLTrainer
-from torchtitan.experiments.rl.unified.infra.parallelism_utils import (
-    create_trainer_parallel_dims,
+from torchtitan.experiments.rl.unified.models.utils import (
+    replace_with_vllm_compatible_flash_attention,
 )
-from torchtitan.experiments.rl.unified.models.utils import load_trainer_model
 from torchtitan.experiments.rl.vllm_compat.simple_rl import (
-    compute_policy_gradient_loss_vllm,
+    compute_grpo_advantages,
+    compute_grpo_advantages_stable,
 )
+from torchtitan.tools import utils
 
 logger = logging.getLogger(__name__)
 
 
 class Trainer(Actor):
     """
-    Updates policy based on collected trajectories.
+    Updates policy based on collected trajectories using TorchTitan components.
 
-    Run model forward on trajectories, computes loss, and run backward.
+    This trainer uses TorchTitan's train_spec, ParallelDims, and optimizer
+    components for model initialization and parallelization.
+
     Receives the top-level ``RLTrainer.Config`` and reads policy trainer
-    settings (batch_invariant_mode, grpo) directly from it, plus model /
-    optimizer / parallelism settings from the nested ``config.trainer``.
-
-    TODO: Use torchtitan Trainer for model init and parallelisation.
+    settings (batch_invariant_mode, policy_optimization) directly from it,
+    plus model / optimizer / parallelism settings from the nested
+    ``config.trainer``.
 
     Args:
         config: Top-level RLTrainer.Config containing all configuration.
@@ -51,36 +69,123 @@ class Trainer(Actor):
         self.ddp_size = trainer_cfg.parallelism.data_parallel_replicate_degree
         self.tp_size = trainer_cfg.parallelism.tensor_parallel_degree
 
-        # GRPO settings from top-level config
+        # Policy optimization settings from top-level config
         self.group_size = config.policy_optimization.group_size
         self.grpo_beta = config.policy_optimization.beta
         self.use_stable_grpo = config.policy_optimization.use_stable
 
-        # Explicitly set cuda device for each trainer, otherwise different processes will use the same CUDA device
-        local_rank = int(os.environ["LOCAL_RANK"])
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(local_rank)
+        # Device setup
+        device_module, device_type = utils.device_module, utils.device_type
+        self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
+        device_module.set_device(self.device)
 
-        # load trainer model and patch to vllm.Attention()
-        self.model = load_trainer_model(model_path)
-        self.parallel_dims = create_trainer_parallel_dims(self.ddp_size, self.tp_size)
+        # Initialize distributed
+        # When running under Monarch, setup_env_for_distributed already
+        # initializes the process group, so skip re-initialization.
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+        else:
+            world_size = dist_utils.init_distributed(trainer_cfg.comm)
 
-        # apply PT-D Parallelism
-        # TODO: right now it only works for qwen3 model, need to formalize this to use parallize_fn from train_spec
-        if self.ddp_size > 1:
-            from torchtitan.models.llama3.infra.parallelize import apply_ddp
+        # Build parallel dims
+        parallelism_config = trainer_cfg.parallelism
+        self.parallel_dims = ParallelDims(
+            dp_shard=parallelism_config.data_parallel_shard_degree,
+            dp_replicate=parallelism_config.data_parallel_replicate_degree,
+            cp=parallelism_config.context_parallel_degree,
+            tp=parallelism_config.tensor_parallel_degree,
+            pp=parallelism_config.pipeline_parallel_degree,
+            ep=parallelism_config.expert_parallel_degree,
+            etp=parallelism_config.expert_tensor_parallel_degree,
+            world_size=world_size,
+        )
 
-            apply_ddp(
-                self.model,
-                self.parallel_dims.get_mesh("dp_replicate"),
-                enable_compile=False,
+        # Get train spec for the model
+        self.train_spec = train_spec_module.get_train_spec(trainer_cfg.model.name)
+
+        # Build model using train_spec
+        model_args = self.train_spec.model_args[trainer_cfg.model.flavor]
+        model_args.update_from_config(trainer_cfg)
+        self.model_args = model_args
+        self.hf_assets_path = trainer_cfg.model.hf_assets_path
+
+        # Initialize state dict adapter for HF checkpoint loading
+        if self.train_spec.state_dict_adapter is not None:
+            self.sd_adapter = self.train_spec.state_dict_adapter(
+                model_args, self.hf_assets_path
             )
+        else:
+            self.sd_adapter = None
 
-        self.model = self.model.to(device)
-        self.model.train()
+        # Build model with meta init
+        with torch.device("meta"):
+            with utils.set_default_dtype(TORCH_DTYPE_MAP[trainer_cfg.training.dtype]):
+                model = self.train_spec.model_cls(model_args)
 
-        # Optimizer
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
+        # Replace attention with vLLM compatible attention for RL training
+        # NOTE: We do this now for attention backward compatibility.
+        # Long-term this will be replaced by pytorch attention supporting paged attention / kv cache
+        replace_with_vllm_compatible_flash_attention(model)
+
+        # Apply parallelization using train_spec's parallelize_fn
+        # NOTE: Apply a temporary parallel plan for Qwen3, need to replace with the plan from TrainSpec
+        from torchtitan.experiments.rl.unified.infra.parallelize import (
+            parallelize_qwen3,
+        )
+
+        model = parallelize_qwen3(
+            model, self.parallel_dims, trainer_cfg, is_trainer=True
+        )
+
+        # Initialize model weights on device
+        model.to_empty(device=device_type)
+        with torch.no_grad():
+            model.init_weights(buffer_device=None)
+
+        # Load initial weights from checkpoint if specified
+        if trainer_cfg.checkpoint.initial_load_path:
+            self._load_initial_weights(model, trainer_cfg.checkpoint.initial_load_path)
+
+        model.train()
+        self.model = model
+        self.model_parts = [model]
+
+        # Create reference model for KL divergence (frozen copy of initial policy)
+        # Build a separate model instance without DDP since it has no trainable params
+        with torch.device("meta"):
+            with utils.set_default_dtype(TORCH_DTYPE_MAP[trainer_cfg.training.dtype]):
+                ref_model = self.train_spec.model_cls(model_args)
+
+        replace_with_vllm_compatible_flash_attention(ref_model)
+
+        # Use parallelize_qwen3 (TP only, no FSDP) for ref_model since it's for inference only
+        ref_model = parallelize_qwen3(
+            ref_model, self.parallel_dims, trainer_cfg, is_trainer=True
+        )
+
+        ref_model.to_empty(device=device_type)
+        with torch.no_grad():
+            ref_model.init_weights(buffer_device=None)
+        # Load weights from the trained model (use strict=False for parallelized state dict)
+        if trainer_cfg.checkpoint.initial_load_path:
+            self._load_initial_weights(
+                ref_model, trainer_cfg.checkpoint.initial_load_path
+            )
+        for p in ref_model.parameters():
+            p.requires_grad = False
+        ref_model.eval()
+        self.ref_model = ref_model
+
+        # Build optimizer using train_spec
+        self.optimizers = self.train_spec.build_optimizers_fn(
+            self.model_parts, trainer_cfg.optimizer, self.parallel_dims
+        )
+
+        # Build LR schedulers using train_spec
+        self.lr_schedulers = self.train_spec.build_lr_schedulers_fn(
+            self.optimizers, trainer_cfg.lr_scheduler, trainer_cfg.training.steps
+        )
+
         self.policy_version = 0
         self.generator: Optional[Any] = None
 
@@ -95,14 +200,29 @@ class Trainer(Actor):
         """Get model weights for generator.
 
         Returns:
-            model state dict
+            model state dict with plain local tensors (DTensors unwrapped
+            to avoid cross-mesh issues when transferring through Monarch).
         """
         titan_state = self.model.state_dict()
-        return titan_state
+
+        # Unwrap DTensors to plain local tensors and clone to break shared storage.
+        # Without clone, to_local() returns a view of the trainer's parameter data.
+        # Since trainer and generator are collocated (same process), Monarch passes
+        # by reference, so the generator's set_model_state_dict can corrupt the
+        # trainer's Replicate params (norm weights) via in-place redistribution.
+        return {
+            k: v.to_local().clone() if isinstance(v, DTensor) else v.clone()
+            for k, v in titan_state.items()
+        }
 
     @endpoint
-    async def step(self, trajectory: TrajectoryData) -> dict:
+    async def step(self, episode: Episodes) -> dict:
         """Perform one training step.
+
+        Computes advantages from rewards, then updates the policy.
+
+        Args:
+            episode: Trajectory data with rewards filled by Grader
 
         Returns:
             Training metrics
@@ -110,33 +230,73 @@ class Trainer(Actor):
         logger.info(
             f"{os.getpid()=} Trainer starts to train {self.policy_version} on traj:"
         )
+
+        # Compute advantages from rewards
+        advantages = self._compute_advantages(episode.rewards)
+
+        # Compute reference log probs using frozen ref_model
+        ref_token_log_probs = []
+        device = next(self.model.parameters()).device
+        with torch.no_grad():
+            for prompt_toks, gen_toks in zip(
+                episode.prompt_token_ids, episode.vllm_token_ids
+            ):
+                token_lps = compute_token_log_probs(
+                    self.ref_model, prompt_toks, gen_toks, device
+                )
+                ref_token_log_probs.append(token_lps)
+
         # Compute loss
-        loss, loss_metrics = compute_policy_gradient_loss_vllm(
+        loss, loss_metrics, batch_token_log_probs = compute_policy_gradient_loss(
             self.model,
-            trajectory.vllm_token_ids,
-            trajectory.vllm_token_log_probs,
-            trajectory.prompt_token_ids,
-            trajectory.advantages,
+            episode.vllm_token_ids,
+            episode.prompt_token_ids,
+            advantages,
+            ref_token_log_probs,
             kl_coef=0.1,
         )
 
-        # Update weights
-        self.optimizer.zero_grad()
+        # Verify bitwise identity between vLLM and computed log probs
+        verification_result = verify_logprob_identity(
+            episode.vllm_token_log_probs,
+            batch_token_log_probs,
+        )
+        logger.info(
+            f"Logprob verification: bitwise_identical={verification_result['bitwise_identical']}, "
+            f"max_delta={verification_result['max_delta']:.6e}, "
+            f"avg_delta={verification_result['avg_delta']:.6e}, "
+            f"tokens_checked={verification_result['total_tokens_checked']}"
+        )
+
+        # Update weights using torchtitan optimizers
+        trainer_cfg = self.config.trainer
+        self.optimizers.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-        self.optimizer.step()
+
+        # Gradient clipping
+        grad_norm = dist_utils.clip_grad_norm_(
+            [p for m in self.model_parts for p in m.parameters()],
+            trainer_cfg.training.max_norm,
+            foreach=True,
+            pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
+        )
+
+        self.optimizers.step()
+        self.lr_schedulers.step()
 
         self.policy_version += 1
 
         # Return metrics
         metrics = {
             "loss": loss.item(),
-            "reward_mean": trajectory.rewards.mean().item(),
-            "reward_std": trajectory.rewards.std().item(),
-            "advantage_mean": trajectory.advantages.mean().item(),
-            "advantage_std": trajectory.advantages.std().item(),
-            "sample_completion": trajectory.completions[0][:80],
+            "reward_mean": episode.rewards.mean().item(),
+            "reward_std": episode.rewards.std().item(),
+            "advantage_mean": advantages.mean().item(),
+            "advantage_std": advantages.std().item(),
+            "sample_completion": episode.completions[0][:80],
             "policy_version": self.policy_version,
+            "grad_norm": grad_norm.item() if hasattr(grad_norm, "item") else grad_norm,
+            "logprob_bitwise_identical": verification_result["bitwise_identical"],
             **loss_metrics,
         }
         logger.info(f"{os.getpid()=} Trainer finish step {self.policy_version}")
