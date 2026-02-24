@@ -164,6 +164,27 @@ llama3_configs = {
             scaling="llama",
         ),
     ),
+    "32B": Llama3Model.Config(
+        dim=8192,
+        n_layers=34,
+        layer=Llama3TransformerBlock.Config(
+            feed_forward=FeedForward.Config(
+                hidden_dim=compute_ffn_hidden_dim(
+                    8192, multiple_of=4096, ffn_dim_multiplier=1.3
+                )
+            ),
+            attention=GQAttention.Config(
+                n_heads=64, n_kv_heads=8, attn_backend="sdpa", rope_backend="complex"
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=8192 // 64,
+            max_seq_len=131072,
+            theta=500000,
+            backend="complex",
+            scaling="llama",
+        ),
+    ),
     "70B": Llama3Model.Config(
         dim=8192,
         n_layers=80,

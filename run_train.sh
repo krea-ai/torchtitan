@@ -25,23 +25,45 @@ set -ex
 #    - Useful for debugging distributed training logic locally
 #    Example: NGPU=32 COMM_MODE="local_tensor" ./run_train.sh
 
+
+cd /vast/sangwu/testing/torchtitan
+source /vast/sangwu/testing/torchtitan/.venv/bin/activate
+
 NGPU=${NGPU:-"8"}
 export LOG_RANK=${LOG_RANK:-0}
 MODULE=${MODULE:-"llama3"}
 CONFIG=${CONFIG:-"llama3_debugmodel"}
 COMM_MODE=${COMM_MODE:-""}
 
-TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
+export NCCL_NET="IB"
+export NCCL_NVLS_ENABLE=1
+export PYTORCH_ALLOC_CONF="expandable_segments:True"
+export NCCL_IB_HCA="=mlx5_0,mlx5_1,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_10,mlx5_11"
 
-if [ -n "$COMM_MODE" ]; then
-    # Communication mode specified: validate configuration or run in debug mode
-    echo "Running with comm_mode=${COMM_MODE}"
-    NGPU="${NGPU}" LOCAL_RANK=0 python3 -m torchtitan.train --module ${MODULE} --config ${CONFIG} "$@" --comm.mode=${COMM_MODE} --training.steps 1
+
+# for torch2.10 compatibility
+export LD_LIBRARY_PATH=/vast/sangwu/envs/torch210/.venv/lib/python3.12/site-packages/nvidia/nvjitlink/lib:$LD_LIBRARY_PATH
+
+echo "Starting training with $WORLD_SIZE machines"
+echo "Master IP: $MASTER_ADDR"
+echo "Master Port: $MASTER_PORT"
+echo "RANK: $RANK"
+echo "MODULE: $MODULE"
+echo "CONFIG: $CONFIG"
+
+
+if [ "$WORLD_SIZE" -gt 1 ]; then
+    torchrun \
+        --nproc_per_node=${NGPU} \
+        --nnodes=$WORLD_SIZE \
+        --node_rank=$RANK \
+        --rdzv-backend=c10d \
+        --rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT \
+        -m torchtitan.train --module ${MODULE} --config ${CONFIG} "$@"
 else
-    # Normal training with torchrun
-    PYTORCH_ALLOC_CONF="expandable_segments:True" \
-    TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE} \
-    torchrun --nproc_per_node=${NGPU} --rdzv_backend c10d --rdzv_endpoint="localhost:0" \
-    --local-ranks-filter ${LOG_RANK} --role rank --tee 3 \
-    -m torchtitan.train --module ${MODULE} --config ${CONFIG} "$@"
+     torchrun \
+        --nproc_per_node=${NGPU} \
+        --nnodes=1 \
+        --standalone \
+        -m torchtitan.train --module ${MODULE} --config ${CONFIG} "$@"
 fi
