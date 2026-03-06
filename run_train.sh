@@ -26,8 +26,6 @@ set -ex
 #    Example: NGPU=32 COMM_MODE="local_tensor" ./run_train.sh
 
 
-cd /vast/sangwu/testing/torchtitan
-source /vast/sangwu/testing/torchtitan/.venv/bin/activate
 
 NGPU=${NGPU:-"8"}
 export LOG_RANK=${LOG_RANK:-0}
@@ -38,11 +36,13 @@ COMM_MODE=${COMM_MODE:-""}
 export NCCL_NET="IB"
 export NCCL_NVLS_ENABLE=1
 export PYTORCH_ALLOC_CONF="expandable_segments:True"
-export NCCL_IB_HCA="=mlx5_0,mlx5_1,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_10,mlx5_11"
+export NCCL_IB_HCA="=mlx5_9,mlx5_8,mlx5_7,mlx5_6,mlx5_5,mlx5_4,mlx5_10,mlx5_11"
 
 
 # for torch2.10 compatibility
-export LD_LIBRARY_PATH=/vast/sangwu/envs/torch210/.venv/lib/python3.12/site-packages/nvidia/nvjitlink/lib:$LD_LIBRARY_PATH
+cd /torchtitan/torchtitan
+source /torchtitan/torchtitan/.venv/bin/activate
+export LD_LIBRARY_PATH=/torchtitan/torchtitan/.venv/lib/python3.12/site-packages/nvidia/nvjitlink/lib:$LD_LIBRARY_PATH
 
 echo "Starting training with $WORLD_SIZE machines"
 echo "Master IP: $MASTER_ADDR"
