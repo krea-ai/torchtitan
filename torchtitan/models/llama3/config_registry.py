@@ -147,8 +147,8 @@ def llama3_32b() -> Trainer.Config:
         model_spec=model_registry("32B"),
         optimizer=OptimizersContainer.Config(lr=1.5e-4),
         training=TrainingConfig(
-            local_batch_size=4,
-            seq_len=8192,
+            local_batch_size=1,
+            seq_len=4096,
             steps=262144,
         ),
         dataloader=HuggingFaceTextDataLoader.Config(
@@ -170,21 +170,71 @@ def llama3_32b_512GPUs() -> Trainer.Config:
         model_spec=model_registry("32B"),
         optimizer=OptimizersContainer.Config(lr=1.5e-4),
         training=TrainingConfig(
-            local_batch_size=2*2,
-            seq_len=8192//1,
+            local_batch_size=1,
+            seq_len=4096,
             steps=262144,
         ),
         dataloader=HuggingFaceTextDataLoader.Config(
             dataset="c4_test",
         ),
         parallelism=ParallelismConfig(
-            data_parallel_replicate_degree=64//1,
-            data_parallel_shard_degree=8*1,
+            data_parallel_replicate_degree=32,
+            data_parallel_shard_degree=16,
         ),
         checkpoint=CheckpointManager.Config(enable=False),
         activation_checkpoint=ActivationCheckpointConfig(mode="full"),
         validator=Validator.Config(enable=False),
     )
+
+
+def llama3_32b_448GPUs() -> Trainer.Config:
+    return Trainer.Config(
+        hf_assets_path="./assets/hf/Llama-3.1-70B",
+        profiling=ProfilingConfig(enable_profiling=False),
+        metrics=MetricsProcessor.Config(log_freq=2048),
+        model_spec=model_registry("32B"),
+        optimizer=OptimizersContainer.Config(lr=1.5e-4),
+        training=TrainingConfig(
+            local_batch_size=1,
+            seq_len=4096,
+            steps=262144,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="c4_test",
+        ),
+        parallelism=ParallelismConfig(
+            data_parallel_replicate_degree=56,
+            data_parallel_shard_degree=8,
+        ),
+        checkpoint=CheckpointManager.Config(enable=False),
+        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        validator=Validator.Config(enable=False),
+    )
+
+def llama3_32b_472GPUs() -> Trainer.Config:
+    return Trainer.Config(
+        hf_assets_path="./assets/hf/Llama-3.1-70B",
+        profiling=ProfilingConfig(enable_profiling=False),
+        metrics=MetricsProcessor.Config(log_freq=2048),
+        model_spec=model_registry("32B"),
+        optimizer=OptimizersContainer.Config(lr=1.5e-4),
+        training=TrainingConfig(
+            local_batch_size=1,
+            seq_len=4096,
+            steps=262144,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="c4_test",
+        ),
+        parallelism=ParallelismConfig(
+            data_parallel_replicate_degree=59,
+            data_parallel_shard_degree=8,
+        ),
+        checkpoint=CheckpointManager.Config(enable=False),
+        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        validator=Validator.Config(enable=False),
+    )
+
 
 def llama3_70b() -> Trainer.Config:
     return Trainer.Config(
